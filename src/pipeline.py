@@ -1,183 +1,100 @@
-            )
-    return pd.DataFrame(rows)
+from __future__ import annotations
+
+import argparse
+import math
+import sqlite3
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Iterable
+
+import pandas as pd
+import requests
 
 
-def fetch_price_history(symbols: list[str], months: int = 6) -> pd.DataFrame:
-    rows: list[pd.DataFrame] = []
-    range_value = f"{max(1, math.ceil(months * 30 / 31))}mo"
+ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = ROOT / "data"
+DB_PATH = DATA_DIR / "taiwan_top10_stocks.sqlite"
 
-    for symbol in symbols:
-        data = _get_json(
-            YAHOO_CHART_URL.format(symbol=symbol),
-            {"range": range_value, "interval": "1d", "events": "history"},
-        )
-        result = data.get("chart", {}).get("result", [])
-        if not result:
-            continue
+YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+YAHOO_SCREENER_URL = "https://query2.finance.yahoo.com/v1/finance/screener"
 
-        chart = result[0]
-        timestamps = chart.get("timestamp", [])
-        quote = chart.get("indicators", {}).get("quote", [{}])[0]
-        frame = pd.DataFrame(quote)
-        if frame.empty or not timestamps:
-            continue
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+}
 
-        frame["date"] = pd.to_datetime(timestamps, unit="s", utc=True).date
-        frame["symbol"] = symbol
-        rows.append(frame[["symbol", "date", "open", "high", "low", "close", "volume"]])
+# Fallback universe: large Taiwan-listed names. The pipeline first tries Yahoo's
+# screener API, then uses this list if Yahoo changes or blocks the screener.
+FALLBACK_SYMBOLS = [
+    "2330.TW",
+    "2317.TW",
+    "2454.TW",
+    "2308.TW",
+    "2382.TW",
+    "2412.TW",
+    "2881.TW",
+    "2882.TW",
+    "2303.TW",
+    "3711.TW",
+    "2891.TW",
+    "2886.TW",
+    "1216.TW",
+    "1303.TW",
+    "1301.TW",
+    "2884.TW",
+    "5871.TW",
+    "3045.TW",
+    "2002.TW",
+    "2207.TW",
+    "2892.TW",
+    "5880.TW",
+    "2885.TW",
+    "3034.TW",
+    "2357.TW",
+    "2327.TW",
+    "2379.TW",
+    "3008.TW",
+    "2395.TW",
+    "2912.TW",
+    "1101.TW",
+    "2603.TW",
+    "2609.TW",
+    "2615.TW",
+    "2880.TW",
+    "2883.TW",
+    "4938.TW",
+    "6669.TW",
+    "1590.TW",
+    "6415.TW",
+    "6505.TW",
+    "5876.TW",
+    "2345.TW",
+    "4904.TW",
+    "9910.TW",
+    "2408.TW",
+    "3661.TW",
+    "6488.TW",
+    "6409.TW",
+    "6446.TW",
+]
 
-    if not rows:
-        return pd.DataFrame(
-            columns=["symbol", "date", "open", "high", "low", "close", "volume"]
-        )
-
-    history = pd.concat(rows, ignore_index=True)
-    for column in ["open", "high", "low", "close", "volume"]:
-        history[column] = pd.to_numeric(history[column], errors="coerce")
-    return history.dropna(subset=["close"]).reset_index(drop=True)
-
-
-def prepare_database(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS top10_quotes (
-            symbol TEXT PRIMARY KEY,
-            name TEXT,
-            long_name TEXT,
-            price REAL,
-            change REAL,
-            change_pct REAL,
-            previous_close REAL,
-            volume REAL,
-            avg_volume_3m REAL,
-            market_cap REAL,
-            high_52w REAL,
-            low_52w REAL,
-            currency TEXT,
-            exchange TEXT,
-            market_time TEXT,
-            refreshed_at TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS price_history (
-            symbol TEXT,
-            date TEXT,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL,
-            volume REAL,
-            PRIMARY KEY (symbol, date)
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS refresh_log (
-            refreshed_at TEXT PRIMARY KEY,
-            symbols_checked INTEGER,
-            top10_rows INTEGER,
-            history_rows INTEGER,
-            source_mode TEXT
-        )
-        """
-    )
-    return conn
-
-
-def run_pipeline(db_path: Path = DB_PATH) -> PipelineResult:
-    source_mode = "yahoo_screener"
-    try:
-        universe = fetch_yahoo_screener_symbols()
-    except Exception:
-        universe = FALLBACK_SYMBOLS
-        source_mode = "fallback_large_cap_symbols"
-
-    try:
-        quotes = fetch_quotes(universe)
-    except Exception:
-        quotes = pd.DataFrame()
-
-    if quotes.empty and source_mode != "fallback_large_cap_symbols":
-        source_mode = "fallback_large_cap_symbols"
-        universe = FALLBACK_SYMBOLS
-        try:
-            quotes = fetch_quotes(universe)
-        except Exception:
-            quotes = pd.DataFrame()
-
-    if quotes.empty:
-        source_mode = "seed_data_yahoo_unavailable"
-        universe = [row["symbol"] for row in SEED_TOP10]
-        quotes = build_seed_quotes()
-
-    top10 = quotes.head(10).copy()
-    try:
-        history = fetch_price_history(top10["symbol"].tolist())
-    except Exception:
-        history = pd.DataFrame()
-    if history.empty:
-        history = build_seed_history(top10)
-    refreshed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-    if "market_time" in top10.columns:
-        top10["market_time"] = top10["market_time"].astype(str)
-    if not history.empty:
-        history["date"] = history["date"].astype(str)
-
-    conn = prepare_database(db_path)
-    with conn:
-        conn.execute("DELETE FROM top10_quotes")
-        top10.to_sql("top10_quotes", conn, if_exists="append", index=False)
-        history.to_sql("price_history", conn, if_exists="replace", index=False)
-        conn.execute(
-            """
-            INSERT INTO refresh_log (
-                refreshed_at, symbols_checked, top10_rows, history_rows, source_mode
-            )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (refreshed_at, len(universe), len(top10), len(history), source_mode),
-        )
-    conn.close()
-
-    return PipelineResult(
-        symbols_checked=len(universe),
-        top10_rows=len(top10),
-        history_rows=len(history),
-        refreshed_at=refreshed_at,
-        source_mode=source_mode,
-    )
-
-
-def load_top10(db_path: Path = DB_PATH) -> pd.DataFrame:
-    conn = prepare_database(db_path)
-    try:
-        return pd.read_sql_query("SELECT * FROM top10_quotes", conn)
-    finally:
-        conn.close()
-
-
-def load_history(db_path: Path = DB_PATH) -> pd.DataFrame:
-    conn = prepare_database(db_path)
-    try:
-        return pd.read_sql_query("SELECT * FROM price_history", conn)
-    finally:
-        conn.close()
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Refresh Taiwan top-10 stock data.")
-    parser.add_argument("--db", type=Path, default=DB_PATH, help="SQLite DB output path")
-    args = parser.parse_args()
-    result = run_pipeline(args.db)
-    print(result)
-
-
-if __name__ == "__main__":
-    main()
+SEED_TOP10 = [
+    {
+        "symbol": "2330.TW",
+        "name": "台積電",
+        "long_name": "Taiwan Semiconductor Manufacturing Company Limited",
+        "price": 979.0,
+        "change": 8.0,
+        "change_pct": 0.82,
+        "previous_close": 971.0,
+        "volume": 36_500_000,
+        "avg_volume_3m": 42_000_000,
+        "market_cap": 25_400_000_000_000,
+        "high_52w": 1080.0,
